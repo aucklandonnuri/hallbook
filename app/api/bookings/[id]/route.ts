@@ -90,9 +90,7 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
 // ---------- DELETE (cancel one or series) ----------
 // 단건 취소:    DELETE /api/bookings/:id
 // 전체 시리즈:  DELETE /api/bookings/:id?mode=series
-export async function DELETE(req: Request, { params }: { params: { id: string } }) {
-  try {
-    const id = params.id?.trim();
+export async function DELETE(_req: Request, { params }: { params: { id: string } }) {  const { id } = params;
     if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
 
     const url = new URL(req.url);
