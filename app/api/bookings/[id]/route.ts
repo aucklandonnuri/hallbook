@@ -1,3 +1,4 @@
+// app/api/bookings/[id]/route.ts
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
@@ -32,10 +33,11 @@ function stripUndefined(obj: Record<string, any>) {
 }
 
 // ---------- PATCH (update one) ----------
-export async function PATCH(req: Request, { params }: { params: { id: string } }) {
+export async function PATCH(req: Request, ctx: RouteContext<"/api/bookings/[id]">) {
   try {
-    const id = params.id?.trim();
-    if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
+    const { id } = await ctx.params;
+    const trimmedId = id?.trim();
+    if (!trimmedId) return NextResponse.json({ error: "Missing id" }, { status: 400 });
 
     const body = await req.json();
 
@@ -73,7 +75,7 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
     const { data, error } = await supabaseAdmin
       .from("bookings")
       .update(updates)
-      .eq("id", id)
+      .eq("id", trimmedId)
       .select()
       .maybeSingle();
 
@@ -90,10 +92,11 @@ export async function PATCH(req: Request, { params }: { params: { id: string } }
 // ---------- DELETE (cancel one or series) ----------
 // 단건 취소:    DELETE /api/bookings/:id
 // 전체 시리즈:  DELETE /api/bookings/:id?mode=series
-export async function DELETE(_req: Request, { params }: { params: { id: string } }) {
+export async function DELETE(req: Request, ctx: RouteContext<"/api/bookings/[id]">) {
   try {
-    const id = params.id?.trim();
-    if (!id) return NextResponse.json({ error: "Missing id" }, { status: 400 });
+    const { id } = await ctx.params;
+    const trimmedId = id?.trim();
+    if (!trimmedId) return NextResponse.json({ error: "Missing id" }, { status: 400 });
 
     const url = new URL(req.url);
     const mode = url.searchParams.get("mode"); // "series" 이면 시리즈 전체 삭제
@@ -103,7 +106,7 @@ export async function DELETE(_req: Request, { params }: { params: { id: string }
       const { data: row, error: readErr } = await supabaseAdmin
         .from("bookings")
         .select("series_id")
-        .eq("id", id)
+        .eq("id", trimmedId)
         .single();
       if (readErr) return NextResponse.json({ error: readErr.message }, { status: 400 });
       if (!row?.series_id) {
@@ -124,7 +127,7 @@ export async function DELETE(_req: Request, { params }: { params: { id: string }
     const { error } = await supabaseAdmin
       .from("bookings")
       .delete()
-      .eq("id", id);
+      .eq("id", trimmedId);
 
     if (error) return NextResponse.json({ error: error.message }, { status: 400 });
 
