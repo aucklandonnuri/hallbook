@@ -1,204 +1,148 @@
 // app/api/bookings/series/route.ts
-import { NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
+import { z } from "zod";
+import { RRule, Frequency } from "rrule"; // Frequency 추가
 
-type Freq = "WEEKLY" | "FORTNIGHTLY" | "MONTHLY";
+const supabaseAdmin = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  { auth: { persistSession: false } }
+);
 
-/** "HH:mm" | "HH:mm:ss" → "HH:mm:ss" */
-function normalizeHm(t: string) {
-  const s = String(t ?? "").trim();
-  if (/^\d{2}:\d{2}:\d{2}$/.test(s)) return s;
-  if (/^\d{2}:\d{2}$/.test(s)) return `${s}:00`;
-  throw new Error(`Invalid time format: ${t}`);
+function normalizeHallIdForDb(rawHallId: unknown): number | string {
+  const s = String(rawHallId ?? "").trim();
+  if (/^\d+$/.test(s)) return Number(s);
+  return s;
 }
-/** "HH:mm[:ss]" → 총 분 */
-function toMinutes(t: string) {
-  const [h, m] = normalizeHm(t).split(":");
-  return Number(h) * 60 + Number(m);
+
+function normalizeBody(raw: any) {
+  const pick = (a: any, ...keys: string[]) => keys.find((k) => a?.[k] !== undefined) as string | undefined;
+
+  const freqKey = pick(raw, "freq", "frequency"); // 'weekly' 또는 'monthly'
+  const hallKey = pick(raw, "hall_id", "hallId");
+  const sdKey = pick(raw, "start_date", "startDate");
+  const edKey = pick(raw, "end_date", "endDate");
+  const stKey = pick(raw, "start_time", "startTime");
+  const etKey = pick(raw, "end_time", "endTime");
+  const intKey = pick(raw, "interval", "intervalWeeks");
+  const daysKey = pick(raw, "byweekday", "weekdays", "days");
+
+  const trim = (v: any) => (typeof v === "string" ? v.trim() : v);
+
+  let byweekday = raw?.[daysKey ?? ""] ?? [];
+  if (!Array.isArray(byweekday)) byweekday = [];
+  byweekday = byweekday.map((v: any) => Number(v)).filter((n: number) => n >= 0 && n <= 6);
+
+  const normTime = (t: any) => {
+    const s = String(t ?? "").trim();
+    return s.length === 5 ? s : s.slice(0, 5); // HH:mm 강제
+  };
+
+  return {
+    freq: trim(raw?.[freqKey ?? ""]) || "weekly", // 기본값 매주
+    hall_id: trim(raw?.[hallKey ?? ""]),
+    start_date: trim(raw?.[sdKey ?? ""]),
+    end_date: trim(raw?.[edKey ?? ""]),
+    start_time: normTime(raw?.[stKey ?? ""]),
+    end_time: normTime(raw?.[etKey ?? ""]),
+    interval: raw?.[intKey ?? ""] ?? 1,
+    byweekday,
+    requester_name: trim(raw?.requester_name ?? raw?.requesterName ?? ""),
+    phone: trim(raw?.phone ?? ""),
+    group_name: trim(raw?.group_name ?? raw?.groupName ?? ""),
+    description: trim(raw?.description ?? ""),
+  };
 }
 
-/** Supabase(admin) */
-const url = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
-const key = process.env.SUPABASE_SERVICE_ROLE_KEY ?? "";
-const sb = createClient(url, key, { auth: { persistSession: false } });
+const sSchema = z.object({
+  freq: z.enum(["weekly", "monthly"]),
+  hall_id: z.union([z.coerce.number(), z.string()]),
+  start_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  end_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  start_time: z.string().regex(/^\d{2}:\d{2}$/),
+  end_time: z.string().regex(/^\d{2}:\d{2}$/),
+  interval: z.coerce.number().int().min(1).default(1),
+  byweekday: z.array(z.coerce.number().int().min(0).max(6)).nonempty(),
+  requester_name: z.string().min(1),
+  phone: z.string().optional().default(""),
+  group_name: z.string().optional().default(""),
+  description: z.string().optional().default(""),
+});
 
-export async function POST(req: Request) {
+const fmtDateLocal = (d: Date) => {
+  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, "0"), dd = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${dd}`;
+};
+
+export async function POST(req: NextRequest) {
   try {
-    const body = (await req.json()) as {
-      hall_id: string | number;
-      start_date: string;      // YYYY-MM-DD
-      start_time: string;      // HH:mm or HH:mm:ss
-      end_time: string;        // HH:mm or HH:mm:ss
-      title?: string;          // 폼의 모임명 (bookings.title 에도 넣어줌)
-      group_name?: string;     // (레거시/다른 호출자용)
-      applicant?: string | null;
-      phone?: string | null;
-      description?: string | null;
-      freq: Freq;
-      occurrences?: number | null;
-      until?: string | null;   // YYYY-MM-DD
-    };
+    const raw = await req.json();
+    const body = normalizeBody(raw);
+    const parsed = sSchema.safeParse(body);
 
-    // ===== 1) 필수값 검증 =====
-    const required = ["hall_id", "start_date", "start_time", "end_time", "freq"] as const;
-    const miss = required.filter((k) => (body as any)[k] == null || String((body as any)[k]).trim() === "");
-    if (miss.length) {
-      return NextResponse.json({ error: `Missing: ${miss.join(", ")}` }, { status: 400 });
-    }
+    if (!parsed.success) return new NextResponse("입력 형식이 올바르지 않습니다", { status: 400 });
 
-    // 모임명(= DB의 group_name) 확보: title 또는 group_name 중 하나
-    const groupName = (body.title ?? body.group_name ?? "").toString().trim();
-    if (!groupName) {
-      return NextResponse.json({ error: "Missing group name (title)" }, { status: 400 });
-    }
+    let { freq, hall_id, start_date, end_date, start_time, end_time, interval, byweekday, requester_name, phone, group_name, description } = parsed.data;
+    const hallIdValue = normalizeHallIdForDb(hall_id);
 
-    // 신청자명(= DB의 requester_name) 확보 (NOT NULL 회피: 빈 문자열 허용)
-    const requesterName = (body.applicant ?? "").toString().trim();
+    const dtStart = new Date(`${start_date}T00:00:00`);
+    const dtUntil = new Date(`${end_date}T23:59:59`);
+    const RR_DAYS = [RRule.SU, RRule.MO, RRule.TU, RRule.WE, RRule.TH, RRule.FR, RRule.SA];
 
-    // 시간 정규화 + 순서 체크
-    const start_time = normalizeHm(body.start_time);
-    const end_time = normalizeHm(body.end_time);
-    if (toMinutes(end_time) <= toMinutes(start_time)) {
-      return NextResponse.json({ error: "end_time must be later than start_time" }, { status: 400 });
-    }
+    const rrule = new RRule({
+      freq: freq === "monthly" ? RRule.MONTHLY : RRule.WEEKLY,
+      interval,
+      byweekday: byweekday.map((d) => RR_DAYS[d]),
+      dtstart: dtStart,
+      until: dtUntil,
+    });
 
-    // 날짜 정규/검증
-    const startDate = new Date(`${body.start_date}T00:00:00`);
-    if (isNaN(startDate.getTime())) return NextResponse.json({ error: "Invalid start_date" }, { status: 400 });
-    const untilDate = body.until ? new Date(`${body.until}T00:00:00`) : null;
-    if (untilDate && isNaN(untilDate.getTime())) return NextResponse.json({ error: "Invalid until" }, { status: 400 });
+    const dates = rrule.all();
+    if (dates.length === 0) return new NextResponse("생성할 예약이 없습니다", { status: 400 });
 
-    // hall_id 정규화 (uuid 문자열/숫자 모두 허용하되 실제 존재 확인)
-    const hallId =
-      typeof body.hall_id === "number"
-        ? body.hall_id
-        : /^\d+$/.test(String(body.hall_id))
-        ? Number(body.hall_id)
-        : String(body.hall_id);
+    // 🔒 강화된 충돌 검사
+    for (const dt of dates) {
+      const day = fmtDateLocal(dt);
+      const { data: conflicts } = await supabaseAdmin
+        .from("bookings")
+        .select("id, requester_name")
+        .eq("hall_id", hallIdValue)
+        .eq("date", day)
+        .lt("start_time", end_time) // 기존 시작 < 새 종료
+        .gt("end_time", start_time); // 기존 종료 > 새 시작
 
-    // ===== 2) hall 존재 확인 =====
-    {
-      const { data: hall, error: hallErr } = await sb
-        .from("halls")
-        .select("id")
-        .eq("id", hallId as any)
-        .maybeSingle();
-      if (hallErr) return NextResponse.json({ error: `Hall lookup failed: ${hallErr.message}` }, { status: 400 });
-      if (!hall) return NextResponse.json({ error: "Invalid hall_id (not found)" }, { status: 400 });
-    }
-
-    // ===== 3) 반복 발생일 계산 =====
-    const addUnit = (d: Date) => {
-      const nd = new Date(d);
-      if (body.freq === "WEEKLY") nd.setDate(nd.getDate() + 7);
-      else if (body.freq === "FORTNIGHTLY") nd.setDate(nd.getDate() + 14);
-      else if (body.freq === "MONTHLY") {
-        // 같은 '날짜'에 최대한 맞추는 월 증분
-        const dom = nd.getDate();
-        nd.setMonth(nd.getMonth() + 1);
-        while (nd.getDate() < dom) nd.setDate(nd.getDate() - 1);
+      if (conflicts && conflicts.length > 0) {
+        return new NextResponse(`충돌 발생: ${day}에 '${conflicts[0].requester_name}'님의 예약이 이미 있습니다.`, { status: 409 });
       }
-      return nd;
-    };
-
-    const maxOcc =
-      body.occurrences && body.occurrences > 0
-        ? body.occurrences
-        : untilDate
-        ? 10000
-        : 10; // until 없으면 기본 10회
-
-    const dates: string[] = [];
-    let cur = startDate;
-    for (let i = 0; i < maxOcc; i++) {
-      const y = cur.getFullYear();
-      const m = String(cur.getMonth() + 1).padStart(2, "0");
-      const d = String(cur.getDate()).padStart(2, "0");
-      dates.push(`${y}-${m}-${d}`);
-
-      const next = addUnit(cur);
-      if (untilDate && next > untilDate) break;
-      cur = next;
-
-      if (i > 500) break; // 안전 가드
     }
-    if (!dates.length) return NextResponse.json({ error: "No occurrences generated" }, { status: 400 });
 
-    // ===== 4) 부모 series 먼저 INSERT =====
-    // - end_date: 생성된 날짜 중 마지막
-    // - byweekday: 생성된 모든 날짜의 요일(0:일~6:토) 중복 제거 정렬
-    const endDate = dates[dates.length - 1];
-    const uniqueWeekdays = Array.from(
-      new Set(
-        dates.map((ds) => {
-          // JS getDay(): 0=Sun..6=Sat
-          const wd = new Date(`${ds}T00:00:00`).getDay();
-          return wd;
-        })
-      )
-    ).sort((a, b) => a - b);
-
-    const interval = body.freq === "FORTNIGHTLY" ? 2 : 1;
-
-    const { data: seriesRow, error: seriesErr } = await sb
+    // Series 및 Bookings 저장 로직 (이하 기존과 동일하되 정확도 개선)
+    const { data: seriesRow, error: sErr } = await supabaseAdmin
       .from("series")
-      .insert({
-        hall_id: hallId as any,
-        start_date: dates[0],
-        end_date: endDate,
-        start_time,
-        end_time,
-        interval,
-        byweekday: uniqueWeekdays,            // integer[]
-        requester_name: requesterName,
-        phone: body.phone ?? null,
-        group_name: groupName,
-        description: body.description ?? null,
-      })
-      .select("id")
-      .single();
+      .insert({ hall_id: hallIdValue, start_date, end_date, start_time, end_time, interval, byweekday, requester_name, phone, group_name, description })
+      .select("id").single();
 
-    if (seriesErr) {
-      return NextResponse.json({ error: `Series insert failed: ${seriesErr.message}` }, { status: 400 });
-    }
-    const series_id = seriesRow!.id;
+    if (sErr) throw new Error(sErr.message);
 
-    // ===== 5) 자식 bookings INSERT (is_series/freq 포함) =====
-    const rows = dates.map((date) => ({
-      hall_id: hallId,
-      date,
+    const rows = dates.map((dt) => ({
+      hall_id: hallIdValue,
+      date: fmtDateLocal(dt),
       start_time,
       end_time,
-      group_name: groupName,         // NOT NULL
-      requester_name: requesterName, // NOT NULL (빈 문자열 허용)
-      phone: body.phone ?? null,
-      description: body.description ?? null,
+      requester_name,
+      phone,
+      group_name,
+      description,
       is_series: true,
-      series_id,                     // ★ 부모에서 받은 실제 uuid
-      title: body.title ?? null,     // bookings.title 컬럼 반영
-      applicant: body.applicant ?? null,
-      freq: body.freq,               // bookings.freq 체크 제약 통과 (세 값 중 하나)
+      series_id: seriesRow.id,
     }));
 
-    const { data, error } = await sb
-      .from("bookings")
-      .insert(rows)
-      .select("id, date, start_time, end_time, hall_id, group_name, requester_name");
+    const { error: bErr } = await supabaseAdmin.from("bookings").insert(rows);
+    if (bErr) throw new Error(bErr.message);
 
-    if (error) {
-      return NextResponse.json({ error: `Bookings insert failed: ${error.message}` }, { status: 400 });
-    }
-
-    return NextResponse.json(
-      { series_id, count: data?.length ?? 0, items: data ?? [] },
-      { status: 200 }
-    );
+    return new NextResponse("예약 성공", { status: 201 });
   } catch (e: any) {
-    console.error("POST /api/bookings/series error:", e);
-    return NextResponse.json({ error: e?.message ?? "Unknown error" }, { status: 500 });
+    return new NextResponse(`서버 오류: ${e.message}`, { status: 500 });
   }
-}
-
-export async function OPTIONS() {
-  return NextResponse.json({}, { status: 200 });
 }
